@@ -66,23 +66,18 @@ if show_server_info:
 
                     try:
                         content = await session.read_resource("search://cortex_search/search_obj/list")
-                        if hasattr(content, 'contents'):
+                        if hasattr(content, 'contents') and isinstance(content.contents, list):
                             for item in content.contents:
                                 if hasattr(item, 'text'):
-                                    text = item.text.strip()
-                                    if text.startswith("[") or text.startswith("{"):
-                                        try:
-                                            objects = json.loads(text)
-                                            if isinstance(objects, list):
-                                                result["search"].extend(objects)
-                                            else:
-                                                result["search"].append(objects)
-                                        except json.JSONDecodeError as err:
-                                            result["search"].append({"error": str(err), "raw": text})
-                                    else:
-                                        result["search"].append({"warning": "Non-JSON response", "raw": text})
+                                    try:
+                                        objects = json.loads(item.text)
+                                        for obj in objects:
+                                            result["search"].append(obj)
+                                        break  # Only handle first valid block like original reference
+                                    except Exception as e:
+                                        result["search"].append({"error": str(e), "raw": item.text})
                     except Exception as e:
-                        result["search"].append(f"Search error: {e}")
+                        result["search"].append({"error": f"Search read error: {str(e)}"})
 
         except Exception as e:
             st.sidebar.error(f"❌ MCP Connection Error: {e}")
