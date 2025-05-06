@@ -4,14 +4,14 @@ import nest_asyncio
 import json
 import yaml
 
-# from langchain_mcp_adapters.client import MultiServerMCPClient
-# from langgraph.prebuilt import create_react_agent
-# from dependencies import SnowFlakeConnector
-# from llmobject_wrapper import ChatSnowflakeCortex
-# from snowflake.snowpark import Session
-
 from mcp.client.sse import sse_client
 from mcp import ClientSession
+
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from dependencies import SnowFlakeConnector
+from llmobject_wrapper import ChatSnowflakeCortex
+from snowflake.snowpark import Session
 
 # Page config
 st.set_page_config(page_title="Healthcare AI Chat", page_icon="🏥")
@@ -26,7 +26,7 @@ show_server_info = st.sidebar.checkbox("🛡 Show MCP Server Info", value=False)
 # --- Show Server Information ---
 if show_server_info:
     async def fetch_mcp_info():
-        result = {"resources": [], "tools": [], "prompts": [], "yaml": [], "search": []}
+        result = {"resources": [], "tools": [], "prompts": [], "yaml": []}
         try:
             async with sse_client(url=server_url) as sse_connection:
                 async with ClientSession(*sse_connection) as session:
@@ -64,21 +64,6 @@ if show_server_info:
                     except Exception as e:
                         result["yaml"].append(f"YAML error: {e}")
 
-                    try:
-                        content = await session.read_resource("search://cortex_search/search_obj/list")
-                        if hasattr(content, 'contents') and isinstance(content.contents, list):
-                            for item in content.contents:
-                                if hasattr(item, 'text'):
-                                    try:
-                                        objects = json.loads(item.text)
-                                        for obj in objects:
-                                            result["search"].append(obj)
-                                        break  # Only handle first valid block like original reference
-                                    except Exception as e:
-                                        result["search"].append({"error": str(e), "raw": item.text})
-                    except Exception as e:
-                        result["search"].append({"error": f"Search read error: {str(e)}"})
-
         except Exception as e:
             st.sidebar.error(f"❌ MCP Connection Error: {e}")
         return result
@@ -105,9 +90,93 @@ if show_server_info:
         for y in mcp_data["yaml"]:
             st.code(y, language="yaml")
 
-    with st.sidebar.expander("🔍 Search Objects", expanded=False):
-        for s in mcp_data["search"]:
-            st.json(s)
-
 else:
-    st.warning("Snowflake and LLM chatbot features are currently disabled. Enable them by uncommenting the related code blocks.")
+    # Re-enable Snowflake and LLM chatbot features
+    @st.cache_resource
+    def get_snowflake_connection():
+        return SnowFlakeConnector.get_conn('aedl', '')
+
+    @st.cache_resource
+    def get_model():
+        sf_conn = get_snowflake_connection()
+        return ChatSnowflakeCortex(
+            model="llama3.1-70b-elevance",
+            cortex_function="complete",
+            session=Session.builder.configs({"connection": sf_conn}).getOrCreate()
+        )
+
+    prompt_type = st.sidebar.radio("Select Prompt Type", ["Calculator", "HEDIS Expert", "Weather"])
+    prompt_map = {
+        "Calculator": "calculator-prompt",
+        "HEDIS Expert": "hedis-prompt",
+        "Weather": "weather-prompt"
+    }
+    examples = {
+        "Calculator": ["(4+5)/2.0", "sqrt(16) + 7", "3^4 - 12"],
+        "HEDIS Expert": [
+            "What are the different race stratification for CBP HEDIS Reporting?",
+            "What are the different HCPCS codes in the Colonoscopy Value set?",
+            "Describe Care for Older Adults Measure"
+        ],
+        "Weather": [
+            "What is the present weather in Richmond?",
+            "What's the weather forecast for Atlanta?",
+            "Is it raining in New York City today?"
+        ]
+    }
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    with st.sidebar.expander("Example Queries", expanded=True):
+        for example in examples[prompt_type]:
+            if st.button(example, key=example):
+                st.session_state.query_input = example
+
+    query = st.chat_input("Type your query here...")
+    if "query_input" in st.session_state:
+        query = st.session_state.query_input
+        del st.session_state.query_input
+
+    async def process_query(query_text):
+        st.session_state.messages.append({"role": "user", "content": query_text})
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            message_placeholder.text("Processing...")
+            try:
+                async with MultiServerMCPClient(
+                    {"DataFlyWheelServer": {"url": server_url, "transport": "sse"}}
+                ) as client:
+                    model = get_model()
+                    agent = create_react_agent(model=model, tools=client.get_tools())
+                    prompt_name = prompt_map[prompt_type]
+                    prompt_from_server = await client.get_prompt(
+                        server_name="DataFlyWheelServer",
+                        prompt_name=prompt_name,
+                        arguments={}
+                    )
+                    if "{query}" in prompt_from_server[0].content:
+                        formatted_prompt = prompt_from_server[0].content.format(query=query_text)
+                    else:
+                        formatted_prompt = prompt_from_server[0].content + query_text
+                    response = await agent.ainvoke({"messages": formatted_prompt})
+                    result = list(response.values())[0][1].content
+                    message_placeholder.text(result)
+                    st.session_state.messages.append({"role": "assistant", "content": result})
+            except Exception as e:
+                error_message = f"Error: {str(e)}"
+                message_placeholder.text(error_message)
+                st.session_state.messages.append({"role": "assistant", "content": error_message})
+
+    if query:
+        asyncio.run(process_query(query))
+
+    if st.sidebar.button("Clear Chat"):
+        st.session_state.messages = []
+        st.experimental_rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("Healthcare AI Chat v1.0")
