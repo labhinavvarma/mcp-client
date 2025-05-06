@@ -1,201 +1,176 @@
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-import json
-import logging
-import statistics
-import mcp.types as types
-import requests  
-import os
-from typing import Optional
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from mcp.server.fastmcp import Context, FastMCP
+import streamlit as st
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
 
-logger = logging.getLogger(__name__)
+# Page configuration
+st.set_page_config(page_title="MCP Testing Interface", page_icon="🔌")
 
-# Create a named server
-NWS_API_BASE = "https://api.weather.gov"
-app = FastAPI(title="DataFlyWheel App")
-mcp = FastMCP("DataFlyWheel App", app=app)
+# App title
+st.title("MCP Testing Interface")
+st.markdown("This interface tests only the MCP connection without LLM or Snowflake.")
 
-# --- MCP JSON Analyzer Tool ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Server configuration
+with st.sidebar.expander("Server Configuration", expanded=True):
+    server_url = st.text_input("Server URL", value="http://10.126.192.183:8000/sse")
+    server_transport = st.selectbox("Transport", ["sse"], index=0)
+
+# Prompt selection
+prompt_type = st.sidebar.radio(
+    "Select Prompt Type",
+    ["Calculator", "HEDIS Expert", "Weather"]
 )
 
-@app.get("/")
-async def root():
-    return {"message": "MCP Server is running"}
+prompt_map = {
+    "Calculator": "calculator-prompt",
+    "HEDIS Expert": "hedis-prompt",
+    "Weather": "weather-prompt"
+}
 
-@app.post("/api/mcp")
-async def mcp_api(request: Request):
-    try:
-        body_bytes = await request.body()
-        logger.info(f"Received request: {body_bytes[:200]}")
-        try:
-            data = json.loads(body_bytes)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
-            return JSONResponse(status_code=400, content={"status": "error", "error": f"Invalid JSON: {str(e)}"})
+# Chat history container
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-        if "data" not in data or "operation" not in data:
-            return JSONResponse(status_code=400, content={"status": "error", "error": "Missing 'data' or 'operation' field"})
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
 
-        input_data = data["data"]
-        operation = data["operation"].lower()
-        valid_operations = ["sum", "mean", "median", "min", "max"]
-        if operation not in valid_operations:
-            return JSONResponse(status_code=400, content={"status": "error", "error": f"Invalid operation. Use one of: {', '.join(valid_operations)}"})
-
-        result = None
-        try:
-            if isinstance(input_data, list):
-                numbers = [float(n) for n in input_data]
-                if not numbers:
-                    return JSONResponse(status_code=400, content={"status": "error", "error": "Empty data list"})
-                result = {
-                    "sum": sum(numbers),
-                    "mean": statistics.mean(numbers),
-                    "median": statistics.median(numbers),
-                    "min": min(numbers),
-                    "max": max(numbers)
-                }[operation]
-            elif isinstance(input_data, dict):
-                results_dict = {}
-                for key, values in input_data.items():
-                    if not isinstance(values, list):
-                        return JSONResponse(status_code=400, content={"status": "error", "error": f"Value for key '{key}' must be a list"})
-                    numbers = [float(n) for n in values]
-                    if not numbers:
-                        return JSONResponse(status_code=400, content={"status": "error", "error": f"Empty data list for key '{key}'"})
-                    results_dict[key] = {
-                        "sum": sum(numbers),
-                        "mean": statistics.mean(numbers),
-                        "median": statistics.median(numbers),
-                        "min": min(numbers),
-                        "max": max(numbers)
-                    }[operation]
-                result = results_dict
-            else:
-                return JSONResponse(status_code=400, content={"status": "error", "error": f"Data must be a list or dictionary, got {type(input_data).__name__}"})
-        except (ValueError, TypeError) as e:
-            logger.error(f"Data processing error: {e}")
-            return JSONResponse(status_code=400, content={"status": "error", "error": f"Data processing error: {str(e)}"})
-
-        return {"status": "success", "result": result}
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"status": "error", "error": "Internal server error"})
-
-# --- Categorized Prompt Library ---
-PROMPT_LIBRARY = {
-    "hedis": [
-        {"name": "Explain BCS Measure", "prompt": "Explain the purpose of the BCS HEDIS measure."},
-        {"name": "List 2024 HEDIS Measures", "prompt": "List all HEDIS measures for the year 2024."},
-        {"name": "Age Criteria for CBP", "prompt": "What is the age criteria for the CBP measure?"}
+# Example queries based on prompt type
+examples = {
+    "Calculator": ["(4+5)/2.0", "sqrt(16) + 7", "3^4 - 12"],
+    "HEDIS Expert": [
+        "What are the different race stratification for CBP HEDIS Reporting?",
+        "What are the different HCPCS codes in the Colonoscopy Value set?",
+        "Describe Care for Older Adults Measure"
     ],
-    "contract": [
-        {"name": "Summarize Contract H123", "prompt": "Summarize contract ID H123 for 2023."},
-        {"name": "Compare Contracts H456 & H789", "prompt": "Compare contracts H456 and H789 on key metrics."}
+    "Weather": [
+        "What is the present weather in Richmond?",
+        "What's the weather forecast for Atlanta?",
+        "Is it raining in New York City today?"
     ]
 }
 
-@mcp.tool(name="ready-prompts", description="Return ready-made prompts by application category")
-def get_ready_prompts(category: Optional[str] = None) -> dict:
-    if category:
-        category = category.lower()
-        if category not in PROMPT_LIBRARY:
-            return {"error": f"No prompts found for category '{category}'"}
-        return {"category": category, "prompts": PROMPT_LIBRARY[category]}
-    else:
-        return {"prompts": PROMPT_LIBRARY}
+# Show example queries
+with st.sidebar.expander("Example Queries", expanded=True):
+    st.write("Click an example to use it:")
+    for example in examples[prompt_type]:
+        if st.button(example, key=example):
+            # Set the query input to this example
+            st.session_state.query_input = example
 
-@mcp.tool(name="calculator", description="""
-    Evaluates a basic arithmetic expression.
-    Supports: +, -, *, /, parentheses, decimals.
+# Input for the query
+query = st.chat_input("Type your query here...")
+if "query_input" in st.session_state:
+    query = st.session_state.query_input
+    del st.session_state.query_input
+
+# Mock response function (since we don't have the real LLM)
+def get_mock_response(prompt_type, query):
+    """Generate a mock response for testing without the LLM"""
+    if prompt_type == "Calculator":
+        return f"[MOCK] Calculator result for: {query}\nThis would normally calculate the result using the MCP server."
+    elif prompt_type == "HEDIS Expert":
+        return f"[MOCK] HEDIS information for: {query}\nThis would normally return healthcare standards information."
+    else:  # Weather
+        return f"[MOCK] Weather information for: {query}\nThis would normally return weather data."
+
+# Function to process query
+async def process_query(query_text):
+    # Add user message to chat history
+    st.session_state.messages.append({"role": "user", "content": query_text})
+    
+    # Create a placeholder for the response
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        message_placeholder.text("Connecting to MCP server...")
+        
+        try:
+            # Connect to MCP client
+            async with MultiServerMCPClient(
+                {
+                    "DataFlyWheelServer": {
+                        "url": server_url,
+                        "transport": server_transport,
+                    }
+                }
+            ) as client:
+                # Get prompt from server based on selection
+                prompt_name = prompt_map[prompt_type]
+                
+                # Log the connection status
+                message_placeholder.text(f"Connected to server. Retrieving prompt: {prompt_name}...")
+                
+                try:
+                    # Attempt to get the prompt from the server
+                    prompt_from_server = await client.get_prompt(
+                        server_name="DataFlyWheelServer",
+                        prompt_name=prompt_name,
+                        arguments={}
+                    )
+                    
+                    # Format the prompt (for display purposes only)
+                    if prompt_from_server and len(prompt_from_server) > 0:
+                        if "{query}" in prompt_from_server[0].content:
+                            formatted_prompt = prompt_from_server[0].content.format(query=query_text)
+                        else:
+                            formatted_prompt = prompt_from_server[0].content + query_text
+                        
+                        prompt_info = f"Successfully retrieved prompt: {prompt_name}\n\n"
+                        prompt_preview = f"Prompt preview (first 100 chars):\n{formatted_prompt[:100]}...\n\n"
+                    else:
+                        prompt_info = f"Retrieved empty prompt from server.\n\n"
+                        prompt_preview = ""
+                    
+                    # Display the tools available
+                    tools = client.get_tools()
+                    tools_info = f"Available tools: {', '.join([tool.name for tool in tools]) if tools else 'None'}\n\n"
+                    
+                    # Generate a mock response since we don't have the LLM
+                    mock_response = get_mock_response(prompt_type, query_text)
+                    
+                    # Compile the complete response
+                    result = f"{prompt_info}{prompt_preview}{tools_info}Mock response:\n{mock_response}"
+                    
+                except Exception as e:
+                    result = f"Error retrieving prompt: {str(e)}\nServer connected, but prompt retrieval failed."
+                
+                # Update the placeholder with the result
+                message_placeholder.text(result)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": result})
+                
+        except Exception as e:
+            error_message = f"MCP Connection Error: {str(e)}\nFailed to connect to the MCP server."
+            message_placeholder.text(error_message)
+            st.session_state.messages.append({"role": "assistant", "content": error_message})
+
+# Process query when submitted
+if query:
+    # Use asyncio to run the async function
+    asyncio.run(process_query(query))
+
+# Debug section
+with st.sidebar.expander("Debug Options", expanded=False):
+    if st.button("Clear Chat History"):
+        st.session_state.messages = []
+        st.experimental_rerun()
+    
+    if st.button("Show Session State"):
+        st.write(st.session_state)
+
+# Add a small footer
+st.sidebar.markdown("---")
+st.sidebar.markdown("MCP Testing Interface v1.0")
+
+# Additional information display
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+### About This Interface
+This is a simplified testing interface that only connects to the MCP server without using 
+the LLM or Snowflake connections. It retrieves prompts from the server and displays information
+about the connection, available tools, and prompt content.
+
+The responses are mocked since we don't have the actual LLM integration.
 """)
-def calculate(expression: str) -> str:
-    try:
-        allowed_chars = "0123456789+-*/(). "
-        if any(char not in allowed_chars for char in expression):
-            return " Invalid characters in expression."
-        result = eval(expression)
-        return f" Result: {result}"
-    except Exception as e:
-        return f" Error: {str(e)}"
-
-@mcp.tool(name="json-analyzer", description="Analyze JSON numeric data by performing operations like sum, mean, median, min, max.")
-def analyze_json(data: dict, operation: str) -> dict:
-    try:
-        valid_operations = ["sum", "mean", "median", "min", "max"]
-        if operation not in valid_operations:
-            return {"error": f"Invalid operation. Must be one of: {', '.join(valid_operations)}"}
-
-        result = {}
-        for key, values in data.items():
-            if not isinstance(values, list):
-                return {"error": f"'{key}' must be a list of numbers"}
-            numbers = [float(n) for n in values]
-            if not numbers:
-                return {"error": f"No numbers provided for '{key}'"}
-            result[key] = {
-                "sum": sum(numbers),
-                "mean": statistics.mean(numbers),
-                "median": statistics.median(numbers),
-                "min": min(numbers),
-                "max": max(numbers)
-            }[operation]
-        return {"status": "success", "result": result}
-    except Exception as e:
-        return {"error": f"Error analyzing data: {str(e)}"}
-
-@mcp.tool()
-def get_weather(latitude: float, longitude: float) -> str:
-    try:
-        headers = {
-            "User-Agent": "MCP Weather Client (your-email@example.com)",
-            "Accept": "application/geo+json"
-        }
-        points_url = f"{NWS_API_BASE}/points/{latitude},{longitude}"
-        points_response = requests.get(points_url, headers=headers)
-        points_response.raise_for_status()
-        points_data = points_response.json()
-        forecast_url = points_data['properties']['forecast']
-        location_name = f"{points_data['properties']['relativeLocation']['properties']['city']}, {points_data['properties']['relativeLocation']['properties']['state']}"
-        forecast_response = requests.get(forecast_url, headers=headers)
-        forecast_response.raise_for_status()
-        forecast_data = forecast_response.json()
-        current_period = forecast_data['properties']['periods'][0]
-        return f" Weather for {location_name}: {current_period['detailedForecast']}"
-    except Exception as e:
-        return f" Error fetching weather data: {str(e)}"
-
-@mcp.prompt(name="hedis-prompt", description="Prompt to interact with hedis")
-async def hedis_template_prompt() -> str:
-    return """You are expert in HEDIS system... {query}"""
-
-@mcp.prompt(name="calculator-prompt", description="Prompt to perform calculations")
-async def calculator_template_prompt() -> str:
-    return """You are expert in performing arithmetic operations. Given an expression, compute the result and verify using calculator tool."""
-
-@mcp.prompt(name="weather-prompt", description="Prompt to report weather")
-async def weather_template_prompt() -> str:
-    return """You are expert in reporting weather. Use coordinates and fetch current forecast using weather tool."""
-
-@mcp.prompt(name="json-analyzer-prompt", description="Prompt to analyze JSON numeric data")
-async def json_analyzer_prompt() -> str:
-    return """You are a data analyst. Perform numeric analysis over JSON data structures using the json-analyzer tool. Supported operations: sum, mean, median, min, max."""
-
-if __name__ == "__main__":
-    import uvicorn
-    print("Starting MCP Server on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
