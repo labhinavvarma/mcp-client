@@ -1,311 +1,108 @@
 import streamlit as st
 import asyncio
+import nest_asyncio
 import json
 import yaml
-from mcp import ClientSession
+
+# from langchain_mcp_adapters.client import MultiServerMCPClient
+# from langgraph.prebuilt import create_react_agent
+# from dependencies import SnowFlakeConnector
+# from llmobject_wrapper import ChatSnowflakeCortex
+# from snowflake.snowpark import Session
+
 from mcp.client.sse import sse_client
+from mcp import ClientSession
 
-# Page configuration
-st.set_page_config(page_title="MCP Server Inspector", page_icon="🔌", layout="wide")
+# Page config
+st.set_page_config(page_title="Healthcare AI Chat", page_icon="🏥")
+st.title("Healthcare AI Chat")
 
-# App title
-st.title("MCP Server Inspector")
-st.markdown("Inspect your MCP server's resources, tools, and prompts")
+nest_asyncio.apply()
 
-# Initialize session state
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "connection_error" not in st.session_state:
-    st.session_state.connection_error = None
-if "server_tabs_index" not in st.session_state:
-    st.session_state.server_tabs_index = 0
+# --- Sidebar Configuration ---
+server_url = st.sidebar.text_input("MCP Server URL", "http://10.126.192.183:8000/sse")
+show_server_info = st.sidebar.checkbox("🛡 Show MCP Server Info", value=False)
 
-# Helper function to run async code
-def async_fetch(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
-# Server connection
-st.sidebar.header("Server Connection")
-server_url = st.sidebar.text_input("Server URL", value="http://10.126.192.183:8001/sse")
-
-# Connection functions
-async def connect_to_server(url):
-    try:
-        sse_connection = await sse_client(url=url)
-        session = await ClientSession(*sse_connection).__aenter__()
-        await session.initialize()
-        return session, sse_connection
-    except Exception as e:
-        return None, None, str(e)
-
-# Define async fetch functions
-async def fetch_prompts(session):
-    try:
-        return await session.list_prompts()
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-async def fetch_tools(session):
-    try:
-        return await session.list_tools()
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-async def fetch_resources(session):
-    try:
-        return await session.list_resources()
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-async def fetch_yaml_content(session):
-    try:
-        return await session.read_resource("schematiclayer://cortex_analyst/schematic_models/hedis_stage_full/list")
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-async def fetch_search_objects(session):
-    try:
-        return await session.read_resource("search://cortex_search/search_obj/list")
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-# Connect button
-if st.sidebar.button("Connect to Server"):
-    with st.sidebar.spinner("Connecting..."):
-        # Clear previous connection state
-        if "session" in st.session_state:
-            del st.session_state.session
-        if "sse_connection" in st.session_state:
-            del st.session_state.sse_connection
-        
-        # Try to connect
+# --- Show Server Information ---
+if show_server_info:
+    async def fetch_mcp_info():
+        result = {"resources": [], "tools": [], "prompts": [], "yaml": [], "search": []}
         try:
-            session, sse_connection = async_fetch(connect_to_server(server_url))
-            if session and sse_connection:
-                st.session_state.session = session
-                st.session_state.sse_connection = sse_connection
-                st.session_state.connected = True
-                st.session_state.connection_error = None
-                st.sidebar.success("✅ Connected to server!")
-            else:
-                st.session_state.connected = False
-                st.session_state.connection_error = "Failed to connect to server"
-                st.sidebar.error("❌ Connection failed!")
+            async with sse_client(url=server_url) as sse_connection:
+                async with ClientSession(*sse_connection) as session:
+                    await session.initialize()
+                    resources = await session.list_resources()
+                    if hasattr(resources, 'resources'):
+                        for r in resources.resources:
+                            result["resources"].append({"name": r.name, "description": r.description})
+
+                    tools = await session.list_tools()
+                    if hasattr(tools, 'tools'):
+                        for t in tools.tools:
+                            result["tools"].append({"name": t.name, "description": getattr(t, 'description', 'No description')})
+
+                    prompts = await session.list_prompts()
+                    if hasattr(prompts, 'prompts'):
+                        for p in prompts.prompts:
+                            args = []
+                            if hasattr(p, 'arguments'):
+                                for arg in p.arguments:
+                                    args.append(f"{arg.name} ({'Required' if arg.required else 'Optional'}): {arg.description}")
+                            result["prompts"].append({
+                                "name": p.name,
+                                "description": getattr(p, 'description', ''),
+                                "args": args
+                            })
+
+                    try:
+                        yaml_content = await session.read_resource("schematiclayer://cortex_analyst/schematic_models/hedis_stage_full/list")
+                        if hasattr(yaml_content, 'contents'):
+                            for item in yaml_content.contents:
+                                if hasattr(item, 'text'):
+                                    parsed = yaml.safe_load(item.text)
+                                    result["yaml"].append(yaml.dump(parsed, sort_keys=False))
+                    except Exception as e:
+                        result["yaml"].append(f"YAML error: {e}")
+
+                    try:
+                        content = await session.read_resource("search://cortex_search/search_obj/list")
+                        if hasattr(content, 'contents'):
+                            for item in content.contents:
+                                if hasattr(item, 'text'):
+                                    objs = json.loads(item.text)
+                                    result["search"].extend(objs)
+                    except Exception as e:
+                        result["search"].append(f"Search error: {e}")
+
         except Exception as e:
-            st.session_state.connected = False
-            st.session_state.connection_error = str(e)
-            st.sidebar.error(f"❌ Connection error: {str(e)}")
+            st.sidebar.error(f"❌ MCP Connection Error: {e}")
+        return result
 
-# Main content
-if st.session_state.connected and "session" in st.session_state:
-    # Server information tabs
-    tabs = st.tabs(["Prompts", "Tools", "Resources", "YAML Content", "Search Objects"])
-    
-    # Prompts tab
-    with tabs[0]:
-        st.header("Available Prompts")
-        if st.button("Refresh Prompts"):
-            with st.spinner("Fetching prompts..."):
-                prompts_result = async_fetch(fetch_prompts(st.session_state.session))
-                st.session_state.prompts_result = prompts_result
-        
-        if "prompts_result" not in st.session_state:
-            with st.spinner("Fetching prompts..."):
-                prompts_result = async_fetch(fetch_prompts(st.session_state.session))
-                st.session_state.prompts_result = prompts_result
-        
-        # Display prompts
-        if isinstance(st.session_state.prompts_result, str) and st.session_state.prompts_result.startswith("Error"):
-            st.error(st.session_state.prompts_result)
-        elif hasattr(st.session_state.prompts_result, 'prompts') and st.session_state.prompts_result.prompts:
-            # Use a set to track prompt names to avoid duplicates
-            seen_prompts = set()
-            for prompt in st.session_state.prompts_result.prompts:
-                if prompt.name not in seen_prompts:
-                    seen_prompts.add(prompt.name)
-                    with st.expander(f"📝 {prompt.name}"):
-                        st.write(f"**Description:** {prompt.description if hasattr(prompt, 'description') and prompt.description else 'No description'}")
-                        
-                        # Display arguments if available
-                        if hasattr(prompt, 'arguments') and prompt.arguments:
-                            st.write("**Arguments:**")
-                            for arg in prompt.arguments:
-                                required_str = "[Required]" if arg.required else "[Optional]"
-                                st.write(f"- {arg.name} {required_str}: {arg.description if hasattr(arg, 'description') else ''}")
-        else:
-            st.info("No prompts found or prompts information unavailable")
-    
-    # Tools tab
-    with tabs[1]:
-        st.header("Available Tools")
-        if st.button("Refresh Tools"):
-            with st.spinner("Fetching tools..."):
-                tools_result = async_fetch(fetch_tools(st.session_state.session))
-                st.session_state.tools_result = tools_result
-        
-        if "tools_result" not in st.session_state:
-            with st.spinner("Fetching tools..."):
-                tools_result = async_fetch(fetch_tools(st.session_state.session))
-                st.session_state.tools_result = tools_result
-        
-        # Display tools
-        if isinstance(st.session_state.tools_result, str) and st.session_state.tools_result.startswith("Error"):
-            st.error(st.session_state.tools_result)
-        elif hasattr(st.session_state.tools_result, 'tools') and st.session_state.tools_result.tools:
-            # Use a set to track tool names to avoid duplicates
-            seen_tools = set()
-            for tool in st.session_state.tools_result.tools:
-                if tool.name not in seen_tools:
-                    seen_tools.add(tool.name)
-                    with st.expander(f"🔧 {tool.name}"):
-                        st.write(f"**Description:** {tool.description if hasattr(tool, 'description') and tool.description else 'No description'}")
-        else:
-            st.info("No tools found or tools information unavailable")
-    
-    # Resources tab
-    with tabs[2]:
-        st.header("Available Resources")
-        if st.button("Refresh Resources"):
-            with st.spinner("Fetching resources..."):
-                resources_result = async_fetch(fetch_resources(st.session_state.session))
-                st.session_state.resources_result = resources_result
-        
-        if "resources_result" not in st.session_state:
-            with st.spinner("Fetching resources..."):
-                resources_result = async_fetch(fetch_resources(st.session_state.session))
-                st.session_state.resources_result = resources_result
-        
-        # Display resources
-        if isinstance(st.session_state.resources_result, str) and st.session_state.resources_result.startswith("Error"):
-            st.error(st.session_state.resources_result)
-        elif hasattr(st.session_state.resources_result, 'resources') and st.session_state.resources_result.resources:
-            for resource in st.session_state.resources_result.resources:
-                with st.expander(f"📚 {resource.name}"):
-                    st.write(f"**Description:** {resource.description if hasattr(resource, 'description') and resource.description else 'No description'}")
-                    
-                    # Check if the resource is parametric
-                    if '{' in resource.name:
-                        st.write(f"**[PARAMETRIC] Parameters:**")
-                        
-                        # Extract all parameters
-                        current_pos = 0
-                        while True:
-                            param_start = resource.name.find('{', current_pos)
-                            if param_start == -1:
-                                break
-                            param_end = resource.name.find('}', param_start)
-                            if param_end == -1:
-                                break
-                            param_name = resource.name[param_start+1:param_end]
-                            st.write(f"- {param_name}")
-                            current_pos = param_end + 1
-        else:
-            st.info("No resources found or resources information unavailable")
-    
-    # YAML Content tab
-    with tabs[3]:
-        st.header("YAML Content")
-        if st.button("Refresh YAML Content"):
-            with st.spinner("Fetching YAML content..."):
-                yaml_result = async_fetch(fetch_yaml_content(st.session_state.session))
-                st.session_state.yaml_result = yaml_result
-        
-        if "yaml_result" not in st.session_state:
-            with st.spinner("Fetching YAML content..."):
-                yaml_result = async_fetch(fetch_yaml_content(st.session_state.session))
-                st.session_state.yaml_result = yaml_result
-        
-        # Display YAML content
-        if isinstance(st.session_state.yaml_result, str) and st.session_state.yaml_result.startswith("Error"):
-            st.error(st.session_state.yaml_result)
-        elif hasattr(st.session_state.yaml_result, 'contents') and st.session_state.yaml_result.contents:
-            for item in st.session_state.yaml_result.contents:
-                if hasattr(item, 'text'):
-                    try:
-                        # Parse YAML content
-                        parsed_yaml = yaml.safe_load(item.text)
-                        
-                        # Convert back to YAML with nice formatting
-                        formatted_yaml = yaml.dump(parsed_yaml, default_flow_style=False, sort_keys=False)
-                        
-                        st.code(formatted_yaml, language="yaml")
-                    except yaml.YAMLError as e:
-                        st.error(f"Failed to parse YAML: {e}")
-                        st.code(item.text)
-        else:
-            st.info("No YAML content found or YAML information unavailable")
-    
-    # Search Objects tab
-    with tabs[4]:
-        st.header("Search Objects")
-        if st.button("Refresh Search Objects"):
-            with st.spinner("Fetching search objects..."):
-                search_result = async_fetch(fetch_search_objects(st.session_state.session))
-                st.session_state.search_result = search_result
-        
-        if "search_result" not in st.session_state:
-            with st.spinner("Fetching search objects..."):
-                search_result = async_fetch(fetch_search_objects(st.session_state.session))
-                st.session_state.search_result = search_result
-        
-        # Display search objects
-        if isinstance(st.session_state.search_result, str) and st.session_state.search_result.startswith("Error"):
-            st.error(st.session_state.search_result)
-        elif hasattr(st.session_state.search_result, 'contents') and st.session_state.search_result.contents:
-            for item in st.session_state.search_result.contents:
-                if hasattr(item, 'text'):
-                    try:
-                        objects = json.loads(item.text)
-                        st.json(objects)
-                    except json.JSONDecodeError as e:
-                        st.error(f"Failed to parse JSON: {e}")
-                        st.code(item.text)
-        else:
-            st.info("No search objects found or search information unavailable")
+    mcp_data = asyncio.run(fetch_mcp_info())
 
-    # Disconnect button
-    if st.sidebar.button("Disconnect"):
-        if "session" in st.session_state:
-            try:
-                # Properly close session
-                async_fetch(st.session_state.session.__aexit__(None, None, None))
-            except:
-                pass
-            del st.session_state.session
-        
-        if "sse_connection" in st.session_state:
-            try:
-                # Properly close connection
-                async_fetch(st.session_state.sse_connection.__aexit__(None, None, None))
-            except:
-                pass
-            del st.session_state.sse_connection
-        
-        st.session_state.connected = False
-        st.experimental_rerun()
+    with st.sidebar.expander("📦 Resources", expanded=False):
+        for r in mcp_data["resources"]:
+            st.markdown(f"**{r['name']}**\n\n{r['description']}")
+
+    with st.sidebar.expander("🛠 Tools", expanded=False):
+        for t in mcp_data["tools"]:
+            st.markdown(f"**{t['name']}**\n\n{t['description']}")
+
+    with st.sidebar.expander("🧐 Prompts", expanded=False):
+        for p in mcp_data["prompts"]:
+            st.markdown(f"**{p['name']}**\n\n{p['description']}")
+            if p["args"]:
+                st.markdown("Arguments:")
+                for a in p["args"]:
+                    st.markdown(f"- {a}")
+
+    with st.sidebar.expander("📄 YAML", expanded=False):
+        for y in mcp_data["yaml"]:
+            st.code(y, language="yaml")
+
+    with st.sidebar.expander("🔍 Search Objects", expanded=False):
+        for s in mcp_data["search"]:
+            st.json(s)
 
 else:
-    if st.session_state.connection_error:
-        st.error(f"Connection error: {st.session_state.connection_error}")
-    
-    st.info("Please connect to an MCP server using the sidebar controls.")
-    
-    # Example of server URL explanation
-    st.markdown("""
-    ### How to Connect
-    1. Enter your MCP server URL in the sidebar
-    2. Click "Connect to Server"
-    3. Explore the tabs to view server information
-    
-    ### Server URL format
-    The typical format is: `http://hostname:port/sse`
-    """)
-
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("MCP Server Inspector v1.0")
+    st.warning("Snowflake and LLM chatbot features are currently disabled. Enable them by uncommenting the related code blocks.")
