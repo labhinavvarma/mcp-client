@@ -172,55 +172,142 @@ with st.sidebar:
         st.header("Server Information")
         server_tabs = st.tabs(["Prompts", "Tools", "Resources", "Search Objects", "YAML Content"])
         
+        # Fetch server information directly
+        async def fetch_server_data():
+            try:
+                async with sse_client(url=server_url) as sse_connection:
+                    async with ClientSession(*sse_connection) as session:
+                        await session.initialize()
+                        return session
+            except Exception as e:
+                st.error(f"Connection error: {e}")
+                return None
+        
         # Prompts tab
         with server_tabs[0]:
-            if st.session_state.server_info["prompts"]:
-                for prompt in st.session_state.server_info["prompts"]:
-                    with st.expander(f"📝 {prompt['name']}"):
-                        st.write(f"**Description:** {prompt['description']}")
-                        if "arguments" in prompt and prompt["arguments"]:
-                            st.write("**Arguments:**")
-                            for arg in prompt["arguments"]:
-                                required_str = "Required" if arg["required"] else "Optional"
-                                st.write(f"- {arg['name']} [{required_str}]: {arg['description']}")
-            else:
-                st.info("No prompts found")
+            st.subheader("Available Prompts")
+            try:
+                session = asyncio.run(fetch_server_data())
+                if session:
+                    prompts = asyncio.run(session.list_prompts())
+                    if hasattr(prompts, 'prompts') and prompts.prompts:
+                        seen_prompts = set()
+                        for prompt in prompts.prompts:
+                            if prompt.name not in seen_prompts:
+                                seen_prompts.add(prompt.name)
+                                with st.expander(f"📝 {prompt.name}"):
+                                    st.write(f"**Description:** {prompt.description if hasattr(prompt, 'description') else 'No description'}")
+                                    if hasattr(prompt, 'arguments') and prompt.arguments:
+                                        st.write("**Arguments:**")
+                                        for arg in prompt.arguments:
+                                            required_str = "Required" if arg.required else "Optional"
+                                            st.write(f"- {arg.name} [{required_str}]: {arg.description if hasattr(arg, 'description') else ''}")
+                    else:
+                        st.info("No prompts found on server")
+            except Exception as e:
+                st.error(f"Error fetching prompts: {e}")
         
         # Tools tab
         with server_tabs[1]:
-            if st.session_state.server_info["tools"]:
-                for tool in st.session_state.server_info["tools"]:
-                    with st.expander(f"🔧 {tool['name']}"):
-                        st.write(f"**Description:** {tool['description']}")
-            else:
-                st.info("No tools found")
+            st.subheader("Available Tools")
+            try:
+                session = asyncio.run(fetch_server_data())
+                if session:
+                    tools = asyncio.run(session.list_tools())
+                    if hasattr(tools, 'tools') and tools.tools:
+                        seen_tools = set()
+                        for tool in tools.tools:
+                            if tool.name not in seen_tools:
+                                seen_tools.add(tool.name)
+                                with st.expander(f"🔧 {tool.name}"):
+                                    st.write(f"**Description:** {tool.description if hasattr(tool, 'description') else 'No description'}")
+                    else:
+                        st.info("No tools found on server")
+            except Exception as e:
+                st.error(f"Error fetching tools: {e}")
         
         # Resources tab
         with server_tabs[2]:
-            if st.session_state.server_info["resources"]:
-                for resource in st.session_state.server_info["resources"]:
-                    with st.expander(f"📚 {resource['name']}"):
-                        st.write(f"**Description:** {resource['description']}")
-                        if "parameters" in resource:
-                            st.write("**Parameters:**")
-                            for param in resource["parameters"]:
-                                st.write(f"- {param}")
-            else:
-                st.info("No resources found")
+            st.subheader("Available Resources")
+            try:
+                session = asyncio.run(fetch_server_data())
+                if session:
+                    resources = asyncio.run(session.list_resources())
+                    if hasattr(resources, 'resources') and resources.resources:
+                        for resource in resources.resources:
+                            with st.expander(f"📚 {resource.name}"):
+                                st.write(f"**Description:** {resource.description if hasattr(resource, 'description') else 'No description'}")
+                                # Check for parametric resources
+                                if '{' in resource.name:
+                                    st.write("**Parameters:**")
+                                    current_pos = 0
+                                    while True:
+                                        param_start = resource.name.find('{', current_pos)
+                                        if param_start == -1:
+                                            break
+                                        param_end = resource.name.find('}', param_start)
+                                        if param_end == -1:
+                                            break
+                                        param_name = resource.name[param_start+1:param_end]
+                                        st.write(f"- {param_name}")
+                                        current_pos = param_end + 1
+                    else:
+                        st.info("No resources found on server")
+            except Exception as e:
+                st.error(f"Error fetching resources: {e}")
         
         # Search Objects tab
         with server_tabs[3]:
-            if st.session_state.server_info["search_objects"]:
-                st.json(st.session_state.server_info["search_objects"])
-            else:
-                st.info("No search objects found")
+            st.subheader("Search Objects")
+            try:
+                session = asyncio.run(fetch_server_data())
+                if session:
+                    try:
+                        content = asyncio.run(session.read_resource("search://cortex_search/search_obj/list"))
+                        if hasattr(content, 'contents') and isinstance(content.contents, list):
+                            objects_found = False
+                            for item in content.contents:
+                                if hasattr(item, 'text'):
+                                    objects = json.loads(item.text)
+                                    st.json(objects)
+                                    objects_found = True
+                                    break
+                            if not objects_found:
+                                st.info("No search objects found on server")
+                    except Exception as e:
+                        st.error(f"Error fetching search objects: {e}")
+            except Exception as e:
+                st.error(f"Error connecting to server: {e}")
         
         # YAML Content tab
         with server_tabs[4]:
-            if st.session_state.server_info["yaml_content"]:
-                st.code(st.session_state.server_info["yaml_content"], language="yaml")
-            else:
-                st.info("No YAML content found")
+            st.subheader("YAML Content")
+            try:
+                session = asyncio.run(fetch_server_data())
+                if session:
+                    try:
+                        yaml_result = asyncio.run(session.read_resource("schematiclayer://cortex_analyst/schematic_models/hedis_stage_full/list"))
+                        if hasattr(yaml_result, 'contents') and yaml_result.contents:
+                            yaml_found = False
+                            for item in yaml_result.contents:
+                                if hasattr(item, 'text'):
+                                    try:
+                                        parsed_yaml = yaml.safe_load(item.text)
+                                        formatted_yaml = yaml.dump(parsed_yaml, default_flow_style=False, sort_keys=False)
+                                        st.code(formatted_yaml, language="yaml")
+                                        yaml_found = True
+                                        break
+                                    except yaml.YAMLError as e:
+                                        st.error(f"Failed to parse YAML: {e}")
+                                        st.code(item.text)
+                                        yaml_found = True
+                                        break
+                            if not yaml_found:
+                                st.info("No YAML content found on server")
+                    except Exception as e:
+                        st.error(f"Error fetching YAML content: {e}")
+            except Exception as e:
+                st.error(f"Error connecting to server: {e}")
 
 # Main chat interface
 chat_col1, chat_col2 = st.columns([3, 1])
