@@ -69,14 +69,18 @@ if show_server_info:
                         if hasattr(content, 'contents'):
                             for item in content.contents:
                                 if hasattr(item, 'text'):
-                                    try:
-                                        objects = json.loads(item.text)
-                                        if isinstance(objects, list):
-                                            result["search"].extend(objects)
-                                        else:
-                                            result["search"].append(objects)
-                                    except Exception as err:
-                                        result["search"].append({"error": str(err), "raw": item.text})
+                                    text = item.text.strip()
+                                    if text.startswith("[") or text.startswith("{"):
+                                        try:
+                                            objects = json.loads(text)
+                                            if isinstance(objects, list):
+                                                result["search"].extend(objects)
+                                            else:
+                                                result["search"].append(objects)
+                                        except json.JSONDecodeError as err:
+                                            result["search"].append({"error": str(err), "raw": text})
+                                    else:
+                                        result["search"].append({"warning": "Non-JSON response", "raw": text})
                     except Exception as e:
                         result["search"].append(f"Search error: {e}")
 
