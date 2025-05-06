@@ -2,175 +2,360 @@ import streamlit as st
 import asyncio
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+import json
+import yaml
 
 # Page configuration
-st.set_page_config(page_title="MCP Testing Interface", page_icon="🔌")
+st.set_page_config(page_title="MCP Healthcare Chatbot", page_icon="🏥", layout="wide")
 
 # App title
-st.title("MCP Testing Interface")
-st.markdown("This interface tests only the MCP connection without LLM or Snowflake.")
+st.title("Healthcare AI Assistant")
+st.markdown("Connect to MCP server and chat with healthcare AI models")
 
-# Server configuration
-with st.sidebar.expander("Server Configuration", expanded=True):
-    server_url = st.text_input("Server URL", value="http://10.126.192.183:8000/sse")
-    server_transport = st.selectbox("Transport", ["sse"], index=0)
-
-# Prompt selection
-prompt_type = st.sidebar.radio(
-    "Select Prompt Type",
-    ["Calculator", "HEDIS Expert", "Weather"]
-)
-
-prompt_map = {
-    "Calculator": "calculator-prompt",
-    "HEDIS Expert": "hedis-prompt",
-    "Weather": "weather-prompt"
-}
-
-# Chat history container
+# Initialize session states
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "server_info" not in st.session_state:
+    st.session_state.server_info = {
+        "resources": [],
+        "tools": [],
+        "prompts": [],
+        "yaml_content": "",
+        "search_objects": []
+    }
+if "server_connected" not in st.session_state:
+    st.session_state.server_connected = False
 
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-# Example queries based on prompt type
-examples = {
-    "Calculator": ["(4+5)/2.0", "sqrt(16) + 7", "3^4 - 12"],
-    "HEDIS Expert": [
-        "What are the different race stratification for CBP HEDIS Reporting?",
-        "What are the different HCPCS codes in the Colonoscopy Value set?",
-        "Describe Care for Older Adults Measure"
-    ],
-    "Weather": [
-        "What is the present weather in Richmond?",
-        "What's the weather forecast for Atlanta?",
-        "Is it raining in New York City today?"
-    ]
-}
-
-# Show example queries
-with st.sidebar.expander("Example Queries", expanded=True):
-    st.write("Click an example to use it:")
-    for example in examples[prompt_type]:
-        if st.button(example, key=example):
-            # Set the query input to this example
-            st.session_state.query_input = example
-
-# Input for the query
-query = st.chat_input("Type your query here...")
-if "query_input" in st.session_state:
-    query = st.session_state.query_input
-    del st.session_state.query_input
-
-# Mock response function (since we don't have the real LLM)
-def get_mock_response(prompt_type, query):
-    """Generate a mock response for testing without the LLM"""
-    if prompt_type == "Calculator":
-        return f"[MOCK] Calculator result for: {query}\nThis would normally calculate the result using the MCP server."
-    elif prompt_type == "HEDIS Expert":
-        return f"[MOCK] HEDIS information for: {query}\nThis would normally return healthcare standards information."
-    else:  # Weather
-        return f"[MOCK] Weather information for: {query}\nThis would normally return weather data."
-
-# Function to process query
-async def process_query(query_text):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": query_text})
+# Server connection sidebar
+with st.sidebar:
+    st.header("Server Connection")
+    server_url = st.text_input("Server URL", value="http://10.126.192.183:8000/sse", 
+                              help="The URL of your MCP server")
+    server_transport = "sse"
     
-    # Create a placeholder for the response
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.text("Connecting to MCP server...")
-        
-        try:
-            # Connect to MCP client
-            async with MultiServerMCPClient(
-                {
-                    "DataFlyWheelServer": {
-                        "url": server_url,
-                        "transport": server_transport,
-                    }
-                }
-            ) as client:
-                # Get prompt from server based on selection
-                prompt_name = prompt_map[prompt_type]
-                
-                # Log the connection status
-                message_placeholder.text(f"Connected to server. Retrieving prompt: {prompt_name}...")
-                
+    # Connect button
+    if st.button("Connect to Server"):
+        with st.spinner("Connecting to MCP server..."):
+            # Function to fetch server information
+            async def fetch_server_info(url):
                 try:
-                    # Attempt to get the prompt from the server
+                    # Use direct MCP connection like in the reference code
+                    async with sse_client(url=url) as sse_connection:
+                        async with ClientSession(*sse_connection) as session:
+                            await session.initialize()
+                            
+                            # Get resources
+                            resources_list = []
+                            resources = await session.list_resources()
+                            if hasattr(resources, 'resources') and resources.resources:
+                                for resource in resources.resources:
+                                    resource_info = {
+                                        "name": resource.name,
+                                        "description": resource.description if hasattr(resource, 'description') else "No description"
+                                    }
+                                    
+                                    # Check for parametric resources
+                                    if '{' in resource.name:
+                                        params = []
+                                        current_pos = 0
+                                        while True:
+                                            param_start = resource.name.find('{', current_pos)
+                                            if param_start == -1:
+                                                break
+                                            param_end = resource.name.find('}', param_start)
+                                            if param_end == -1:
+                                                break
+                                            param_name = resource.name[param_start+1:param_end]
+                                            params.append(param_name)
+                                            current_pos = param_end + 1
+                                        resource_info["parameters"] = params
+                                    
+                                    resources_list.append(resource_info)
+                            
+                            # Get tools
+                            tools_list = []
+                            tools = await session.list_tools()
+                            if hasattr(tools, 'tools') and tools.tools:
+                                seen_tools = set()
+                                for tool in tools.tools:
+                                    if tool.name not in seen_tools:
+                                        seen_tools.add(tool.name)
+                                        tools_list.append({
+                                            "name": tool.name,
+                                            "description": tool.description if hasattr(tool, 'description') and tool.description else "No description"
+                                        })
+                            
+                            # Get prompts
+                            prompts_list = []
+                            try:
+                                prompts = await session.list_prompts()
+                                if hasattr(prompts, 'prompts') and prompts.prompts:
+                                    seen_prompts = set()
+                                    for prompt in prompts.prompts:
+                                        if prompt.name not in seen_prompts:
+                                            seen_prompts.add(prompt.name)
+                                            prompt_info = {
+                                                "name": prompt.name,
+                                                "description": prompt.description if hasattr(prompt, 'description') and prompt.description else "No description"
+                                            }
+                                            
+                                            # Add arguments if available
+                                            if hasattr(prompt, 'arguments') and prompt.arguments:
+                                                prompt_info["arguments"] = []
+                                                for arg in prompt.arguments:
+                                                    prompt_info["arguments"].append({
+                                                        "name": arg.name,
+                                                        "required": arg.required,
+                                                        "description": arg.description if hasattr(arg, 'description') else ""
+                                                    })
+                                            
+                                            prompts_list.append(prompt_info)
+                            except Exception as e:
+                                st.error(f"Error listing prompts: {e}")
+                            
+                            # Get YAML content
+                            yaml_content = ""
+                            try:
+                                yaml_result = await session.read_resource("schematiclayer://cortex_analyst/schematic_models/hedis_stage_full/list")
+                                if hasattr(yaml_result, 'contents') and yaml_result.contents:
+                                    for item in yaml_result.contents:
+                                        if hasattr(item, 'text'):
+                                            try:
+                                                parsed_yaml = yaml.safe_load(item.text)
+                                                yaml_content = yaml.dump(parsed_yaml, default_flow_style=False, sort_keys=False)
+                                            except yaml.YAMLError as e:
+                                                yaml_content = f"Failed to parse YAML: {e}\nRaw content: {item.text}"
+                            except Exception as e:
+                                yaml_content = f"Error reading YAML content: {e}"
+                            
+                            # Get search objects
+                            search_objects = []
+                            try:
+                                content = await session.read_resource("search://cortex_search/search_obj/list")
+                                if hasattr(content, 'contents') and isinstance(content.contents, list):
+                                    for item in content.contents:
+                                        if hasattr(item, 'text'):
+                                            objects = json.loads(item.text)
+                                            search_objects = objects
+                                            break
+                            except Exception as e:
+                                st.error(f"Error getting search objects: {e}")
+                            
+                            return {
+                                "resources": resources_list,
+                                "tools": tools_list,
+                                "prompts": prompts_list,
+                                "yaml_content": yaml_content,
+                                "search_objects": search_objects
+                            }
+                except Exception as e:
+                    st.error(f"Connection error: {e}")
+                    return None
+            
+            # Run the async function to fetch server info
+            server_info = asyncio.run(fetch_server_info(server_url))
+            
+            if server_info:
+                st.session_state.server_info = server_info
+                st.session_state.server_connected = True
+                st.success("✅ Connected to server successfully!")
+            else:
+                st.error("❌ Failed to connect to server")
+    
+    # Only show these options if connected
+    if st.session_state.server_connected:
+        st.success("Connected to server")
+        
+        # Server information tabs
+        st.header("Server Information")
+        server_tabs = st.tabs(["Prompts", "Tools", "Resources", "Search Objects", "YAML Content"])
+        
+        # Prompts tab
+        with server_tabs[0]:
+            if st.session_state.server_info["prompts"]:
+                for prompt in st.session_state.server_info["prompts"]:
+                    with st.expander(f"📝 {prompt['name']}"):
+                        st.write(f"**Description:** {prompt['description']}")
+                        if "arguments" in prompt and prompt["arguments"]:
+                            st.write("**Arguments:**")
+                            for arg in prompt["arguments"]:
+                                required_str = "Required" if arg["required"] else "Optional"
+                                st.write(f"- {arg['name']} [{required_str}]: {arg['description']}")
+            else:
+                st.info("No prompts found")
+        
+        # Tools tab
+        with server_tabs[1]:
+            if st.session_state.server_info["tools"]:
+                for tool in st.session_state.server_info["tools"]:
+                    with st.expander(f"🔧 {tool['name']}"):
+                        st.write(f"**Description:** {tool['description']}")
+            else:
+                st.info("No tools found")
+        
+        # Resources tab
+        with server_tabs[2]:
+            if st.session_state.server_info["resources"]:
+                for resource in st.session_state.server_info["resources"]:
+                    with st.expander(f"📚 {resource['name']}"):
+                        st.write(f"**Description:** {resource['description']}")
+                        if "parameters" in resource:
+                            st.write("**Parameters:**")
+                            for param in resource["parameters"]:
+                                st.write(f"- {param}")
+            else:
+                st.info("No resources found")
+        
+        # Search Objects tab
+        with server_tabs[3]:
+            if st.session_state.server_info["search_objects"]:
+                st.json(st.session_state.server_info["search_objects"])
+            else:
+                st.info("No search objects found")
+        
+        # YAML Content tab
+        with server_tabs[4]:
+            if st.session_state.server_info["yaml_content"]:
+                st.code(st.session_state.server_info["yaml_content"], language="yaml")
+            else:
+                st.info("No YAML content found")
+
+# Main chat interface
+chat_col1, chat_col2 = st.columns([3, 1])
+
+with chat_col1:
+    # Prompt selection
+    prompt_type = st.selectbox(
+        "Select Prompt Type",
+        ["Calculator", "HEDIS Expert", "Weather"]
+    )
+    
+    prompt_map = {
+        "Calculator": "calculator-prompt",
+        "HEDIS Expert": "hedis-prompt",
+        "Weather": "weather-prompt"
+    }
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    
+    # Input for the query
+    query = st.chat_input("Type your query here...")
+    
+    # Function to process query
+    async def process_query(query_text):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": query_text})
+        
+        # Show thinking message
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            message_placeholder.text("Processing...")
+            
+            try:
+                # Connect to MCP client
+                async with MultiServerMCPClient(
+                    {
+                        "DataFlyWheelServer": {
+                            "url": server_url,
+                            "transport": server_transport,
+                        }
+                    }
+                ) as client:
+                    # Create a mock model for testing
+                    class MockLLM:
+                        async def ainvoke(self, messages):
+                            return {"response": f"This is a mock response for: {messages.get('messages', '')}"}
+                    
+                    # Create the agent with tools from the server
+                    tools = client.get_tools()
+                    agent = create_react_agent(model=MockLLM(), tools=tools)
+                    
+                    # Get prompt from server
+                    prompt_name = prompt_map[prompt_type]
                     prompt_from_server = await client.get_prompt(
                         server_name="DataFlyWheelServer",
                         prompt_name=prompt_name,
                         arguments={}
                     )
                     
-                    # Format the prompt (for display purposes only)
-                    if prompt_from_server and len(prompt_from_server) > 0:
-                        if "{query}" in prompt_from_server[0].content:
-                            formatted_prompt = prompt_from_server[0].content.format(query=query_text)
-                        else:
-                            formatted_prompt = prompt_from_server[0].content + query_text
-                        
-                        prompt_info = f"Successfully retrieved prompt: {prompt_name}\n\n"
-                        prompt_preview = f"Prompt preview (first 100 chars):\n{formatted_prompt[:100]}...\n\n"
+                    # Format the prompt
+                    if "{query}" in prompt_from_server[0].content:
+                        formatted_prompt = prompt_from_server[0].content.format(query=query_text)
                     else:
-                        prompt_info = f"Retrieved empty prompt from server.\n\n"
-                        prompt_preview = ""
+                        formatted_prompt = prompt_from_server[0].content + query_text
                     
-                    # Display the tools available
-                    tools = client.get_tools()
-                    tools_info = f"Available tools: {', '.join([tool.name for tool in tools]) if tools else 'None'}\n\n"
+                    # Show testing result
+                    result = f"""
+                    === Server Connection Test ===
                     
-                    # Generate a mock response since we don't have the LLM
-                    mock_response = get_mock_response(prompt_type, query_text)
+                    ✅ Successfully connected to server
+                    ✅ Retrieved prompt: "{prompt_name}"
+                    ✅ Found {len(tools)} tools
                     
-                    # Compile the complete response
-                    result = f"{prompt_info}{prompt_preview}{tools_info}Mock response:\n{mock_response}"
+                    === Query Information ===
+                    Your query: {query_text}
                     
-                except Exception as e:
-                    result = f"Error retrieving prompt: {str(e)}\nServer connected, but prompt retrieval failed."
-                
-                # Update the placeholder with the result
-                message_placeholder.text(result)
-                
-                # Add assistant response to chat history
-                st.session_state.messages.append({"role": "assistant", "content": result})
-                
-        except Exception as e:
-            error_message = f"MCP Connection Error: {str(e)}\nFailed to connect to the MCP server."
-            message_placeholder.text(error_message)
-            st.session_state.messages.append({"role": "assistant", "content": error_message})
+                    === In Production ===
+                    In a production environment with the real LLM, this query would be processed
+                    using the {prompt_type} prompt and the available tools.
+                    
+                    To see a full list of available prompts, tools, and resources, check the tabs
+                    in the sidebar.
+                    """
+                    
+                    # Update placeholder with result
+                    message_placeholder.text(result)
+                    
+                    # Add to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": result})
+                    
+            except Exception as e:
+                error_message = f"Error processing query: {str(e)}"
+                message_placeholder.text(error_message)
+                st.session_state.messages.append({"role": "assistant", "content": error_message})
 
-# Process query when submitted
-if query:
-    # Use asyncio to run the async function
-    asyncio.run(process_query(query))
+    # Process query when submitted
+    if query:
+        # Check if connected to server
+        if not st.session_state.server_connected:
+            st.warning("Please connect to the server first using the button in the sidebar")
+        else:
+            # Use asyncio to run the async function
+            asyncio.run(process_query(query))
 
-# Debug section
-with st.sidebar.expander("Debug Options", expanded=False):
+with chat_col2:
+    # Example queries based on prompt type
+    st.subheader("Example Queries")
+    examples = {
+        "Calculator": ["(4+5)/2.0", "sqrt(16) + 7", "3^4 - 12"],
+        "HEDIS Expert": [
+            "What are the different race stratification for CBP HEDIS Reporting?",
+            "What are the different HCPCS codes in the Colonoscopy Value set?",
+            "Describe Care for Older Adults Measure"
+        ],
+        "Weather": [
+            "What is the present weather in Richmond?",
+            "What's the weather forecast for Atlanta?",
+            "Is it raining in New York City today?"
+        ]
+    }
+    
+    # Show examples for the selected prompt type
+    for example in examples[prompt_type]:
+        if st.button(example, key=f"example_{example}"):
+            # Set as if user had entered this query
+            asyncio.run(process_query(example))
+    
+    # Clear chat button
     if st.button("Clear Chat History"):
         st.session_state.messages = []
         st.experimental_rerun()
-    
-    if st.button("Show Session State"):
-        st.write(st.session_state)
 
-# Add a small footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("MCP Testing Interface v1.0")
-
-# Additional information display
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-### About This Interface
-This is a simplified testing interface that only connects to the MCP server without using 
-the LLM or Snowflake connections. It retrieves prompts from the server and displays information
-about the connection, available tools, and prompt content.
-
-The responses are mocked since we don't have the actual LLM integration.
-""")
+# Add a footer
+st.markdown("---")
+st.markdown("Healthcare AI Assistant powered by MCP and LangChain")
