@@ -69,8 +69,14 @@ if show_server_info:
                         if hasattr(content, 'contents'):
                             for item in content.contents:
                                 if hasattr(item, 'text'):
-                                    objs = json.loads(item.text)
-                                    result["search"].extend(objs)
+                                    try:
+                                        objects = json.loads(item.text)
+                                        if isinstance(objects, list):
+                                            result["search"].extend(objects)
+                                        else:
+                                            result["search"].append(objects)
+                                    except Exception as err:
+                                        result["search"].append({"error": str(err), "raw": item.text})
                     except Exception as e:
                         result["search"].append(f"Search error: {e}")
 
